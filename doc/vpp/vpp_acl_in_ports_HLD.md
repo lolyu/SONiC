@@ -547,7 +547,7 @@ Two dataplane notes for larger scopes:
 
 ### VPP Changes
 
-Carried as a patch in the `sonic-platform-vpp` VPP patch series (`vppbld/patches/0019-acl-match-on-ingress-interface.patch`).
+Carried as a patch in the `sonic-platform-vpp` VPP patch series (`vppbld/patches/0018-acl-match-on-ingress-interface.patch`).
 
 | File | Change |
 |------|--------|
@@ -587,7 +587,7 @@ Modified methods:
 
 | Repository | File | Change |
 |------------|------|--------|
-| `sonic-platform-vpp` | `vppbld/patches/0019-acl-match-on-ingress-interface.patch` | The VPP change above |
+| `sonic-platform-vpp` | `vppbld/patches/0018-acl-match-on-ingress-interface.patch` | The VPP change above |
 | `sonic-platform-vpp` | `vppbld/patches/series` | Register the patch |
 | `sonic-platform-vpp` | `rules/vpp.mk` | `VPP_VERSION` `2606-0.5` → `2606-0.6` |
 | `sonic-sairedis` | `vslib/vpp/SwitchVpp.h` | Declaration |
@@ -601,6 +601,7 @@ Adding a field to `acl_rule` changes the layout of the `acl_add_replace` message
 - `sonic-platform-vpp` and `sonic-sairedis` are a matched pair; neither is useful alone.
 - `rules/vpp.mk` bumps `VPP_VERSION` to `2606-0.6`. This is required whenever the patch series changes, because the version string is the cache key for the prebuilt debs — without the bump, consumers keep downloading debs built from the old series, and the CRC drift appears as an ACL programming failure at runtime rather than as a build error.
 - An unrelated patch in flight ([sonic-platform-vpp#280](https://github.com/sonic-net/sonic-platform-vpp/pull/280), which stops VPP counting ACL policy denies as interface drops) also takes `2606-0.6`, since either may merge first. Because both make the *identical* edit to that line, git auto-resolves `rules/vpp.mk` without flagging a conflict — only `vppbld/patches/series` conflicts. **Whoever merges second must bump `VPP_VERSION` to `2606-0.7` by hand** while resolving that conflict, or the published deb will carry a version minted for only one of the two patch series.
+- The two patches are numbered `0018` (this one) and `0019` (#280) so that they occupy distinct slots and can merge in either order without a filename collision. They touch disjoint files — this one only `src/plugins/acl/{acl.c,acl_types.api,hash_lookup.c,public_inlines.h,types.h}`, #280 only `src/plugins/acl/dataplane_node.c`, `src/vnet/buffer.h` and `src/vnet/interface_output.c` — so neither depends on the other and apply order does not matter. If #280 is abandoned, `0019` should be reclaimed by the next patch rather than left as a permanent gap.
 
 ---
 
