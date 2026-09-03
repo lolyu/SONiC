@@ -53,6 +53,7 @@
 | v0.1 | 08/20/2026 | Longxiang Lyu (lolv@microsoft.com) | Initial Draft |
 | v0.2 | 08/29/2026 | Longxiang Lyu (lolv@microsoft.com) | Reworked to match the implementation. Scope is now carried by a new per-rule ingress interface match in the VPP ACL plugin, with saivpp fanning each entry out into one rule per named port, replacing the binding-layer partitioning design of v0.1 |
 | v0.3 | 09/01/2026 | Longxiang Lyu (lolv@microsoft.com) | Review feedback. Documented that the matched 5-tuple slot holds the TX interface on an outbound-bound ACL, so an `IN_PORTS` entry in an egress table now produces no rule instead of silently matching the egress port; explained `sw_if_index` pool recycling and the resulting bound on the 16-bit limit; separated the terms *bound* and *named* to keep binding distinct from matching |
+| v0.4 | 09/03/2026 | Longxiang Lyu (lolv@microsoft.com) | Review feedback. An entry whose `IN_PORTS` cannot be resolved now produces no rule for that entry instead of failing the whole table, since `IngressTableDrop` is shared between MuxOrch and the PFC watchdog and the failure was not rolled back; recorded that `MuxAclHandler` builds an egress `DROP` table carrying `MATCH_IN_PORTS` when `mux_tunnel_egress_acl` is enabled, correcting the earlier claim that no in-tree consumer reaches the egress path |
 
 ---
 
@@ -245,10 +246,13 @@ Multiple entries with *different* `IN_PORTS` in one table is a shipping configur
 | Consumer | Table | Shape |
 |----------|-------|-------|
 | MuxOrch | `IngressTableDrop` | One rule, `IN_PORTS` = all standby mux ports, match any, `DROP` |
+| MuxOrch (egress variant) | `EgressTableDrop` | Same rule shape, but the table is **egress**. Only when `SYSTEM_DEFAULTS\|mux_tunnel_egress_acl` is `enabled`, which defaults to `mellanox`-only — see [Why This Is Ingress-Only](#why-this-is-ingress-only) |
 | PFC watchdog | `IngressTableDrop` (same table) | One rule **per queue id** (`Rule_PfcWdAclHandler_<qid>`), `IN_PORTS` = storming ports, match `TC=<qid>`, `DROP` |
 | GCU dynamic ACL | `DYNAMIC_ACL_TABLE` | Three `DROP` rules naming three *different* ports, alongside unscoped `FORWARD` rules |
 
 The built-in `DROP` table type declares exactly two match qualifiers — `SAI_ACL_TABLE_ATTR_FIELD_TC` and `SAI_ACL_TABLE_ATTR_FIELD_IN_PORTS` (`aclorch.cpp`) — which is what allows MuxOrch and the PFC watchdog to coexist in one table. `SAI_ACL_TABLE_ATTR_FIELD_IN_PORTS` is in fact a *mandatory* ingress match for this type, so an ingress `DROP` table always carries it. Two lossless queues storming on different ports likewise produce two rules with disjoint `IN_PORTS` — reachable on a box with no dual-ToR configuration at all.
+
+That MuxOrch and the PFC watchdog share `IngressTableDrop` is also why an unresolvable entry must not fail the table: doing so would stop the watchdog from programming because of a mux port, and vice versa. See [Failure Handling](#failure-handling).
 
 ---
 
@@ -355,7 +359,11 @@ Skipping the entry keeps the failure contained and matches how an enabled-but-em
 
 Concretely, `fill_acl_rules()` resolves the table's stage (from `SAI_ACL_TABLE_ATTR_ACL_STAGE`) the first time it meets an entry carrying `IN_PORTS`, and emits no rule for such an entry when the stage is `SAI_ACL_STAGE_EGRESS`. A table with no scoped entry never reaches this path, and an unreadable stage is treated as ingress, so the guard cannot itself take a table down.
 
-No SONiC consumer creates such a table today — every consumer in [Consumers of `IN_PORTS` in SONiC](#consumers-of-in_ports-in-sonic) is ingress — but the combination is reachable by configuration alone rather than requiring a code change: both `TABLE_TYPE_MIRROR` and `TABLE_TYPE_L3V4V6` declare `IN_PORTS` as a match, aclorch enables both stages for this platform, and `EVERFLOW_EGRESS` is a standard minigraph-generated egress `MIRROR` table.
+This is not a hypothetical combination. `MuxAclHandler` builds one directly when `SYSTEM_DEFAULTS|mux_tunnel_egress_acl` has `status` set to `enabled`: it creates `EGRESS_TABLE_DROP` with `stage = ACL_STAGE_EGRESS` (`muxorch.cpp`), and `createMuxAclRule()` adds `MATCH_IN_PORTS` to the rule **unconditionally** — its comment reads "add MATCH_IN_PORTS as match criteria for ingress table", but the code does not branch on `is_ingress_acl_`. So the very feature this design exists to fix has an egress variant that would land in this path.
+
+`init_cfg.json.j2` defaults that key to `enabled` only on `mellanox` and `disabled` on every other platform, so on a VPP switch the mux tables are ingress and the guard stays dormant. It is one CONFIG_DB key away from being live, though, which is why the behaviour is defined rather than left to chance. **`mux_tunnel_egress_acl` should remain disabled on VPP**: the qualifier means *ingress* port even in an egress table, and VPP cannot honour that at the egress node, so enabling it would leave the mux drop rule with no effect. This is recorded in [Restrictions and Limitations](#restrictions-and-limitations).
+
+Beyond that, the combination is reachable by configuration alone rather than requiring a code change: both `TABLE_TYPE_MIRROR` and `TABLE_TYPE_L3V4V6` declare `IN_PORTS` as a match, aclorch enables both stages for this platform, and `EVERFLOW_EGRESS` is a standard minigraph-generated egress `MIRROR` table.
 
 Supporting egress scoping properly would mean matching `OUT_PORTS` against the TX interface, which the same mechanism could carry. That is deliberately out of scope here; see [Restrictions and Limitations](#restrictions-and-limitations).
 
@@ -424,6 +432,8 @@ for each interface I in resolved_interfaces:
 
 **Step 3 — resolve names late.** Rules carry `in_hwif_name`, not an index. `vpp_acl_add_replace()` translates the name to a `sw_if_index` when it builds the API message. The SAI layer therefore keeps working in interface names, exactly as it already does for binding, and nothing above the wire format has to track VPP indices.
 
+The loop in step 2 is also what implements every skip case. An entry that is scoped but whose resolved set is empty — because the list was empty, because it could not be read, or because the table turned out to be egress — runs zero iterations and so contributes zero rules, with its original rules already removed from the output list. There is no separate code path for skipping.
+
 Because the copies are appended consecutively, an entry's rules remain **contiguous** from `ace.vpp_rule_base_index`, which is what keeps counters working unchanged — see [Counters](#counters).
 
 #### Worked Example
@@ -466,6 +476,8 @@ Throughout this table, "the ACL" is the table's single VPP ACL — the one every
 | Table with no unscoped entries | The mux drop table with a single scoped entry | Nothing special: the ACL holds only scoped rules. No placeholder is required |
 | Entry fans out with protocol expansion | Port-based entry, no protocol, 2 named ports | 4 rules — the UDP/TCP expansion happens first, then each is replicated per port |
 | `IN_PORTS` present but empty | Qualifier enabled with a zero-length port list | The entry names no interface, so no ingress interface can be a member and it matches nothing. No rule is emitted. Logged as a warning |
+| `IN_PORTS` unresolvable | List cannot be read, or no named port maps to a VPP interface | No rule is emitted for that entry, logged at error severity. The rest of the table programs normally — REQ-6 |
+| Scoped entry in an egress table | Mux drop rule with `mux_tunnel_egress_acl` enabled | No rule is emitted for that entry, logged at error severity. The scope cannot be honoured at the egress node |
 
 ### Programming Flow
 
@@ -506,11 +518,13 @@ Three distinct conditions can leave the resolved interface set empty, and they d
 |-----------|---------|-----------|
 | Attribute absent or not enabled | Entry is unscoped | One rule, `in_sw_if_index = 0`, as before |
 | Enabled but names no port | Entry matches nothing | Scoped, no rule emitted |
-| Port list unreadable, or no named port resolves | Scope is **unknown** | Error; ACL programming fails |
+| Port list unreadable, or no named port resolves | Scope is **unknown** | Error logged; no rule emitted for that entry |
 
-The third row is the one REQ-6 turns on. When the scope cannot be determined, neither available fallback is safe: emitting the rule unscoped applies it to every bound port, which is exactly the outage described in [Observed Impact](#observed-impact), while emitting nothing silently drops an entry orchagent believes is installed. `fill_acl_rules()` therefore returns a failure, `CHECK_STATUS_ACLTBLCONFIG` cleans up, and the function returns **before** `vpp_acl_add_replace()` is reached — so the previously programmed ACL remains in force and the operation is reported as failed.
+The third row is the one REQ-6 turns on. When the scope cannot be determined, emitting the rule unscoped would apply it to every bound port, which is exactly the outage described in [Observed Impact](#observed-impact). The entry therefore produces no rule, and the rest of the table programs normally.
 
-Partial resolution is tolerated: if some named ports resolve and others do not, the entry is scoped to those that did, and each failure is logged. Ports genuinely absent from VPP cannot carry traffic, so scoping to the resolvable subset is equivalent for matching purposes. Only *total* failure to resolve is treated as an error, since that is indistinguishable from a broken read.
+Failing the whole table was considered and rejected, for the same reasons set out in [Why This Is Ingress-Only](#why-this-is-ingress-only). ACL tables are shared — MuxOrch's drop rule and the PFC watchdog's rules both live in `IngressTableDrop` — so one unresolvable entry would stop unrelated features from programming. The failure would also be sticky: `createAclEntry()` commits the entry to `m_objectHash` and `m_acl_tbl_rules_map` before `AclAddRemoveCheck()` runs and rolls back neither, so every later add or remove on that table would walk the same entry and fail again, leaving the table frozen at its last good rule set while orchagent reported the rule `ACTIVE`.
+
+Partial resolution follows the same rule rather than a separate one: rules are emitted for the ports that resolved, and each failure is logged. Ports genuinely absent from VPP cannot carry traffic, so scoping to the resolvable subset is equivalent for matching purposes, and resolving *none* is simply the degenerate case of that. Emitting nothing when only some ports resolve would be strictly worse for a DENY entry — it would drop the scoping on the ports that were resolvable too.
 
 The empty-list case is deliberately left as "matches nothing". No ingress interface can be a member of an empty list, so emitting no rule is the faithful translation of the SAI semantics. Treating it as unscoped would invert it into "match every bound port".
 
@@ -572,7 +586,7 @@ New method:
 
 | Method | Purpose |
 |--------|---------|
-| `acl_entry_in_ports_get()` | Resolve an entry's `IN_PORTS` to VPP interface names. Returns `sai_status_t` and reports scoping through a separate `scoped` out-parameter, so "is scoped" and "could be resolved" stay distinguishable |
+| `acl_entry_in_ports_get()` | Resolve an entry's `IN_PORTS` to VPP interface names. Reports scoping through a separate `scoped` out-parameter, so "is scoped" and "could be resolved" stay distinguishable. A scope that cannot be resolved is reported as an **empty interface set**, not as a status, so the cost falls on that entry rather than on the table — see [Failure Handling](#failure-handling) |
 
 Modified methods:
 
@@ -611,7 +625,9 @@ Adding a field to `acl_rule` changes the layout of the `acl_add_replace` message
 - **Rule count grows with the scope.** An entry naming N ports costs N rules. The ACL count is unchanged, but a large fan-out of otherwise identical rules can be folded by tuplemerge onto one collision chain that `split_partition()` cannot split, since it has no interface dimension. Matching stays correct; the cost is lookup efficiency at large N.
 - **Requires a patched VPP.** The field does not exist upstream, so `sonic-sairedis` and the `sonic-platform-vpp` VPP package must stay in step. Upstreaming the plugin change would remove this coupling.
 - **ip2me state remains table-keyed.** `m_ip2me_drop_tables` is keyed by table, not by interface, so the ip2me bypass is enabled for a table if *any* of its rules contains a deny, regardless of which ports those rules name. Re-keying it per interface is out of scope.
-- **`IN_PORTS` on an egress table has no effect.** The 5-tuple slot this design matches on holds the TX interface when an ACL is bound outbound, so an ingress scope programmed into an egress table would silently match the *egress* port. saivpp therefore emits no rule for such an entry and logs an error, leaving the rest of the table programmable — see [Why This Is Ingress-Only](#why-this-is-ingress-only). No SONiC consumer creates this configuration today, though it is reachable by configuration alone.
+- **`IN_PORTS` on an egress table has no effect.** The 5-tuple slot this design matches on holds the TX interface when an ACL is bound outbound, so an ingress scope programmed into an egress table would silently match the *egress* port. saivpp therefore emits no rule for such an entry and logs an error, leaving the rest of the table programmable — see [Why This Is Ingress-Only](#why-this-is-ingress-only).
+- **`mux_tunnel_egress_acl` must stay disabled on VPP.** With `SYSTEM_DEFAULTS|mux_tunnel_egress_acl` set to `enabled`, `MuxAclHandler` puts its drop rule — which always carries `MATCH_IN_PORTS` — into an egress `DROP` table, which the restriction above then leaves without effect. The key defaults to `disabled` on every platform except `mellanox`, so this is the shipped behaviour and not a change; it is called out because it is the one in-tree configuration that reaches the egress path.
+- **An entry whose `IN_PORTS` cannot be resolved produces no rule.** If the list cannot be read, or none of the named ports resolves to a VPP interface, the entry is skipped and logged at error severity rather than programmed unscoped. The rest of the table is unaffected — see [Failure Handling](#failure-handling).
 - **`OUT_PORTS` is not implemented.** Egress scoping as a feature is untouched; `SAI_ACL_ENTRY_ATTR_FIELD_OUT_PORTS` remains unhandled and is still accepted-and-discarded, exactly as `IN_PORTS` was before this design. The same per-rule mechanism could carry it — matching the TX interface an outbound-bound ACL already puts in the key — but that is separate work with its own test surface.
 - **A rule's interface index is resolved once, at programming time.** VPP recycles `sw_if_index` from a free list, and nothing here invalidates a rule's stored index if the interface it names is deleted. This is safe only because `IN_PORTS` is declared `@objects SAI_OBJECT_TYPE_PORT` and front-panel ports are created at startup and not deleted at runtime; it would need revisiting if the qualifier were ever extended to objects with runtime churn, such as LAGs. See [Encoding and Its Limit](#encoding-and-its-limit).
 
@@ -654,7 +670,7 @@ The binding is deliberately identical on standby and active ports; the scope now
 | Priority preserved | A scoped `DROP` and a higher-priority unscoped `FORWARD` in one table resolve in priority order on the named port — REQ-3 |
 | Independent scopes | Two entries of one table scoped to *different* ports — the mux drop on one, a PFC watchdog rule on another — each drop only on the port its own entry names, and removing one entry leaves the other's port still dropping — REQ-4 |
 | Other tables preserved | After a toggle, every other table bound to the transitioning port is still bound, with unchanged content and position — REQ-5 |
-| Scoped read failure | A forced `IN_PORTS` read failure leaves the previous ACL in place and reports failure, rather than applying the entry everywhere — REQ-6 |
+| Scoped read failure | A forced `IN_PORTS` read failure produces **no** rule for that entry rather than applying it everywhere — REQ-6. Assert both halves: nothing widens to the other ports, **and** the table's other entries still program, so one unresolvable entry cannot freeze a table shared with the PFC watchdog |
 | Counter fan-out | An entry scoped to several ports reports the **sum** of the traffic hitting it on all of them, not one port's share — REQ-7 |
 | Oversized index rejected | An `in_sw_if_index` above `0xffff` is refused by `acl_add_list()` on both the API and CLI paths rather than matching a different interface |
 | Egress `IN_PORTS` skipped | An entry carrying `IN_PORTS` in a table at `SAI_ACL_STAGE_EGRESS` produces **no** VPP rule and logs an error, rather than being installed and matched against the TX interface. Assert both halves: no rule reaches VPP for that entry, **and** the table's other entries still program — a test asserting only "traffic is not dropped" would pass for the wrong reason |
