@@ -209,7 +209,7 @@ The targets are proposals, to be confirmed against baselines measured on the phy
 | N2 | Requests for one port are processed in the order their notifications arrive. As with `SubscriberStateTable`, a request is a row read when its notification is handled, so a row written again before then is handled with its latest value. | |
 | N3 | Ports are initialized in parallel | All active-active ports initialized within 1 s with every SoC unreachable (Python: ports × 0.5 s) |
 | N4 | Memory | Device with only active-active ports: RSS ≤ 15 MB. Device with active-standby ports: RSS ≤ 70% of Python's on the same device. |
-| N5 | Threads and DB connections bounded, independent of the port count | ≤ 16 threads besides those of driver calls in flight (at most 2 per active-standby port), ≤ 48 Redis connections per namespace |
+| N5 | Threads and DB connections bounded, independent of the port count | ≤ 16 threads besides those of driver calls in flight (at most 3 per active-standby port, a firmware download included), ≤ 48 Redis connections per namespace |
 | N6 | CPU | Idle CPU no higher than Python's |
 | N7 | Every external call (gRPC, vendor driver, Redis) has a deadline, or runs where it can only block its own port | |
 | N8 | If an internal task fails, the process exits non-zero and supervisord restarts it, as with Python | Exit immediately (Python: within 60 s) |
