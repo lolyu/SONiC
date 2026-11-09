@@ -1,4 +1,4 @@
-<!-- Part 5 of 5 of doc/dualtor/ycabled_to_rust_hld.md (sonic-net/SONiC#2635), lines 1093-1292. Split only because the file exceeds Copilot's per-file review limit; links to sections in other parts do not resolve here. -->
+<!-- Part 5 of 5 of doc/dualtor/ycabled_to_rust_hld.md (sonic-net/SONiC#2635), lines 1094-1293. Split only because the file exceeds Copilot's per-file review limit; links to sections in other parts do not resolve here. -->
 
 ## 5 Performance and memory
 
@@ -13,7 +13,7 @@ The baselines are in [Section 1.2.2](#122-resource-usage). The active-active num
 | Telemetry pass, 32 unreachable SoCs | 64 s, longer than the 60 s period | About 2 s per port, in parallel | Per-port timers |
 | RSS, active-active only | 41 MB (dev VM, 32 channels) | ≤ 15 MB | No interpreter |
 | RSS, active-standby | 53-54 MB (KVM, 24 ports) | ≤ 37 MB (70%) | Interpreter only for the drivers, no per-thread DB connectors |
-| Threads | 5, plus about 1 per active-active channel (53 with 32 channels) | ≤ 16 while no driver call hangs | tokio; blocking threads only while a driver call runs |
+| Threads | 5, plus about 1 per active-active channel (53 with 32 channels) | ≤ 16, plus one per driver call in flight | tokio; blocking threads only while a driver call runs |
 | Redis connections | 124 (KVM, 24 ports) | ≤ 48 per namespace (4 by design) | One connection per database and one pub/sub connection for all subscriptions (D9) |
 | Idle CPU | 0.7-0.8% of one core (KVM, 24 active-standby ports) | No higher than Python's | Event-driven, no 100 ms select loop |
 
@@ -21,9 +21,9 @@ The baselines are in [Section 1.2.2](#122-resource-usage). The active-active num
 
 Run both implementations on the same DUT and image, switching with `use_rust_ycabled`:
 
-- **Memory:** RSS and PSS from `/proc/<pid>/smaps_rollup`, threads from `/proc/<pid>/status`, Redis connections with `ss -tanp`. Measure 10 minutes after startup and again after a toggle storm.
+- **Memory:** RSS and PSS from `/proc/<pid>/smaps_rollup`, threads from `/proc/<pid>/status`, Redis connections with `ss -tanp`. Measure 10 minutes after startup and again after a toggle storm, and record the peak thread count during startup and the storm.
 - **Latency:**
-  - toggles: `MUX_METRICS_TABLE` `xcvrd_switch_*` start and end
+  - toggles: from orchagent's write of the request to ycabled's STATE_DB `HW_MUX_CABLE_TABLE` write, which includes the time a request waits behind others; `MUX_METRICS_TABLE` `xcvrd_switch_*` cover only the handling
   - probes: time from the command write to the response write, in the test harness
 - **Fault injection:** make K SoCs unreachable with nic_simulator or by dropping their traffic with iptables.
 - **Startup:** from supervisord's "spawned" message to the last `HW_MUX_CABLE_TABLE` row written.

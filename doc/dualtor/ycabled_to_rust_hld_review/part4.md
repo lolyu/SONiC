@@ -1,4 +1,4 @@
-<!-- Part 4 of 5 of doc/dualtor/ycabled_to_rust_hld.md (sonic-net/SONiC#2635), lines 893-1092. Split only because the file exceeds Copilot's per-file review limit; links to sections in other parts do not resolve here. -->
+<!-- Part 4 of 5 of doc/dualtor/ycabled_to_rust_hld.md (sonic-net/SONiC#2635), lines 893-1093. Split only because the file exceeds Copilot's per-file review limit; links to sections in other parts do not resolve here. -->
 
 ### 4.3 Components
 
@@ -16,7 +16,7 @@
 - **Library:** the `redis` crate with tokio (D9). One module, `db.rs`, gives it swss-common's semantics, and the rest of the code uses a `Db` trait with an in-memory mock for unit tests:
   - DB IDs, separators, host and port come from `database_config.json`, or `database_global.json` for the namespaces, as swss-common reads them. Like Python's `daemon_base.db_connect`, ycabled-rs connects over TCP.
   - `set` is one multi-field `HSET`, which merges fields as swss-common's `Table::set` does.
-  - A subscription is what `SubscriberStateTable` does: `PSUBSCRIBE __keyspace@<db>__:<table><sep>*`, then the rows that already exist (`KEYS` and `HGETALL`), then one `HGETALL` per notification. A `del` notification is a DEL; a notification for a row that is gone again is skipped.
+  - A subscription is what `SubscriberStateTable` does: `PSUBSCRIBE __keyspace@<db>__:<table><sep>*`, then the rows that already exist (`KEYS` and `HGETALL`), then one `HGETALL` per notification. A `del` notification is a DEL; a notification for a row that is gone again is skipped. A notification carries no value, so a row written several times before its notification is handled is read with its latest value each time, as with `SubscriberStateTable`: requests are states, not events (N2).
   - Waiting for `CONFIG_DB_INITIALIZED` subscribes to its keyspace notification instead of polling.
   - If the subscription connection is lost, ycabled-rs logs an error and exits 1, and supervisord restarts it (N8).
 - **Ready-table dispatch:** each keyspace notification names its table and key, so the namespace's subscription task reads that row only and passes the change to the namespace's routing task, which sends it to the port's actor. Both handle the notifications in the order redis delivered them, whatever the table, so a port's requests reach its actor in that order: a toggle written after a cable insertion runs after it. A notification never makes ycabled-rs look at another table.
@@ -45,9 +45,9 @@
   - active-standby: the port's call lock, a fair mutex, covers every call to the cable: driver calls, presence checks, and loading and unloading the driver. A request holds it while it runs, and the pass takes it for one call at a time. A toggle waits for at most one call of the pass, no call of the pass comes between the calls of a request, and two calls to one cable never overlap. Python takes its port lock per call.
   - active-active: RPCs share the port's HTTP/2 channel and do not wait for each other, as in Python, whose threads share one stub.
   - A pass that overlaps an initialization, a removal or a change of cable type of its port, while it waits for its turn or while it runs, is not written, because its values may be stale.
-- **Mailboxes:** unbounded, so no request is dropped: a port that cannot keep up queues its requests, in order, as Python's subscriber tables do, and a backlog of 256 is logged. Routing never waits for a mailbox, so other ports are not affected. Requests for ports that are not in `MUX_CABLE` are dropped, as Python does. CLI commands for such ports get Python's answer for a port without a Y-cable driver, or without a cable if `TRANSCEIVER_INFO` has none.
+- **Mailboxes:** bounded without losing anything. A port keeps at most one pending request per table: a newer notification for the same table replaces the pending one in its place, since both would read the same latest row ([Section 4.3.2](#432-db-access)). A `TRANSCEIVER_INFO` removal followed by an insertion is kept as both, so a swapped cable is removed, then initialized. A port whose driver call never returns therefore holds a few requests, not an ever-growing queue. Routing never waits for a mailbox, so other ports are not affected. Requests for ports that are not in `MUX_CABLE` are dropped, as Python does. CLI commands for such ports get Python's answer for a port without a Y-cable driver, or without a cable if `TRANSCEIVER_INFO` has none.
 - **Long-running work:** a firmware download runs in its own task, so toggles for that port are not held up for minutes. Telemetry and the CLI read the driver's `download_firmware_status` and, while it is in progress, report the last known firmware versions, as Python does ([Section 3.3.9](#339-cli-commands)). So the driver must accept other calls while `download_firmware` runs. Python ycabled relies on this too: it calls `download_firmware` without the port lock.
-- **Startup:** the subscriptions start once every port is initialized, or after 30 s, and first deliver the rows that already exist ([Section 4.4](#44-workflows)). A port's requests wait behind its own initialization, so a driver call that never returns holds up only its port.
+- **Startup:** `TRANSCEIVER_INFO` is subscribed to before the ports initialize, so a cable inserted or removed meanwhile is handled right after its port's initialization. The request subscriptions start once every port is initialized, or after 30 s. Each subscription first delivers the rows that already exist ([Section 4.4](#44-workflows)). A port's requests wait behind its own initialization, so a driver call that never returns holds up only its port.
 
 #### 4.3.4 SoC gRPC client
 
@@ -55,7 +55,7 @@
 - **Requests and replies:** the same requests, and the same reply parsing by read_side, as Python ([Section 3.4.1](#341-soc-grpc-service)).
 - **TLS:** from `GRPCCLIENT`: the CA from `ca_crt`, a client identity from `client_crt` and `client_key` for mutual authentication, and the domain name from `grpc_ssl_credential`. Files are read when the channel is created, as in Python, and `/etc/sonic/grpc_secrets.json` is applied to CONFIG_DB at startup.
 - **Connectivity:** tonic does not report gRPC connectivity states, but linkmgrd depends on when `response=failure` is written (C2).
-  - ycabled-rs wraps the connector (`Endpoint::connect_with_connector`) to see connection attempts, successful connections and closed connections.
+  - ycabled-rs wraps the connector (`Endpoint::connect_with_connector`) to see connection attempts, established connections and closed connections. A connection counts as established only once TLS, when configured, and the HTTP/2 handshake have completed, as in grpc-core; one that fails or does not complete them within the RPC deadline counts as failed.
   - From those events a per-port state machine derives `CONNECTING`, `READY`, `TRANSIENT_FAILURE` and `IDLE`. Entering `TRANSIENT_FAILURE` or `IDLE` writes `FORWARDING_STATE_RESPONSE` `response=failure`, and every state is recorded for `grpc_connection_status`.
   - No reconnect timer: a failed or closed connection is set up again by the port's next RPC. grpc-core retries in the background with backoff and, while it waits, fails RPCs at once. ycabled-rs lets each RPC wait for its 0.5 s deadline instead. For a SoC that accepts no HTTP/2 connection, ycabled-rs answers up to 0.5 s later than Python, but only on that port ([Section 5.3](#53-measured-results)).
   - The black-box tests run a SoC double that accepts, drops, refuses and blackholes connections, and check the resulting writes for both implementations.
@@ -114,8 +114,8 @@
 1. Connect to the default namespace's databases and wait for `CONFIG_DB_INITIALIZED`. Read `DEVICE_METADATA` to detect VS, and find the namespaces.
 2. Write `XCVRD_LOG|Y_CABLE` `log_verbosity=notice`, as Python does. Build the port map, and per namespace determine read_side from Loopback3 (looked up again when an active-active cable is initialized while it is still unknown, as Python does), apply `grpc_secrets.json` to CONFIG_DB and read the `MUX_CABLE` ports.
 3. Start the Y-cable bridge if any port is active-standby.
-4. Create an actor for every `MUX_CABLE` port. All actors initialize in parallel, and startup waits until every port is initialized, for at most 30 s.
-5. Start the subscriptions: `TRANSCEIVER_INFO`, and the request tables if the namespace has mux ports. Each first delivers the rows that already exist, so requests written during startup are handled then, as in Python.
+4. Create an actor for every `MUX_CABLE` port and subscribe to `TRANSCEIVER_INFO`, then initialize all actors in parallel. A cable inserted or removed meanwhile is handled right after its port's initialization. Startup waits until every port is initialized, for at most 30 s.
+5. Start the subscriptions of the request tables if the namespace has mux ports. Each first delivers the rows that already exist, so requests written during startup are handled then, as in Python.
 6. Start the GracefulRestart tasks if any port is active-active, with the read side known then: like Python, look Loopback3 up again if it is still unknown.
 
 **Toggles of two ports, one SoC not responding.** Compare with the serial case in [Section 3.3.3](#333-active-active-toggle-self-and-peer):
@@ -150,7 +150,8 @@ sequenceDiagram
 | Area | Python | Rust | Reason |
 | --- | --- | --- | --- |
 | Concurrency | Every port in one thread, one request at a time | One actor per port | N1 |
-| Startup | Ports initialized one by one; threads start after the last port | Ports initialized in parallel; subscriptions start after the last port, as in Python, or after 30 s | N3; a hung driver call holds up only its port |
+| Startup | Ports initialized one by one; threads start after the last port | Ports initialized in parallel; the request subscriptions start after the last port, as in Python, or after 30 s | N3; a hung driver call holds up only its port |
+| Cable removed during startup | Missed: `TRANSCEIVER_INFO` is subscribed to after initialization, and its first rows do not include the removed cable | Handled after the port's initialization | `TRANSCEIVER_INFO` is subscribed to before initialization |
 | Order across tables | Within one select wake-up, a fixed table order; cable insertion and removal in another thread | The order redis delivered the notifications, for all of a namespace's tables | A toggle written after a cable insertion runs after it ([Section 4.3.2](#432-db-access)) |
 | Shutdown | Never ends by itself; tables kept | Exits within 2 s; tables kept | N9, C7 |
 | Thread or task failure | Process killed within 60 s | Process exits at once | N8 |
